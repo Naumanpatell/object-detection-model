@@ -15,6 +15,9 @@ TH = {
     "happy_width_ratio": 1.10,
     "shocked_mouth_delta": 0.08,
     "shocked_brow_delta": 0.025,
+    "angry_score": 0.08,      # min frown score (relative brow drop + brow squeeze)
+    "angry_noise_k": 3.0,     # threshold must also exceed k x the person's own jitter
+    "angry_calib_frames": 30, # frames for the optional 'a' frown calibration
     "sad_curve_delta": -0.012,
     "smooth_window": 8,
 }
@@ -26,14 +29,16 @@ NEUTRAL_DEFAULTS = {
     "smile_curve": 0.015,
     "eye_open": 0.070,
     "brow": 0.130,
+    "brow_gap": 0.200,
 }
 
-FEATURE_NAMES = ["mouth_open", "mouth_width", "smile_curve", "eye_open", "brow"]
-LABELS = ["happy", "shocked", "sad", "sleepy", "neutral"]
+FEATURE_NAMES = ["mouth_open", "mouth_width", "smile_curve", "eye_open", "brow", "brow_gap"]
+LABELS = ["happy", "shocked", "angry", "sad", "sleepy", "neutral"]
 
 COLOURS = {
     "happy": (0, 215, 255),
     "shocked": (0, 140, 255),
+    "angry": (40, 40, 220),
     "sad": (230, 130, 40),
     "sleepy": (190, 90, 160),
     "neutral": (190, 190, 190),
@@ -46,6 +51,7 @@ LM = {
     "l_eye_top": 159, "l_eye_bottom": 145,
     "r_eye_top": 386, "r_eye_bottom": 374,
     "l_brow": 105, "r_brow": 334,
+    "l_brow_inner": 55, "r_brow_inner": 285,
 }
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -100,31 +106,71 @@ def extract_features(pts):
                      + dist(pts, LM["r_eye_top"], LM["r_eye_bottom"])) / 2 / face_w,
         "brow": (dist(pts, LM["l_brow"], LM["l_eye_top"])
                  + dist(pts, LM["r_brow"], LM["r_eye_top"])) / 2 / face_w,
+        "brow_gap": dist(pts, LM["l_brow_inner"], LM["r_brow_inner"]) / face_w,
     }
 
 
 # 3. CALIBRATE
+def frown_score(f, base):
+    """How much the brows dropped + squeezed together, as fractions of this person's neutral face."""
+    brow_drop = (base["brow"] - f["brow"]) / base["brow"]
+    gap_drop = (base["brow_gap"] - f["brow_gap"]) / base["brow_gap"]
+    return brow_drop + gap_drop
+
+
 class Calibrator:
-    def __init__(self, n_frames=TH["calib_frames"]):
+    def __init__(self, n_frames=TH["calib_frames"], n_frown=TH["angry_calib_frames"]):
         self.n_frames = n_frames
+        self.n_frown = n_frown
         self.reset()
 
     def reset(self):
         self.samples = []
         self.baseline = None
+        self.frown_samples = None  # list while the angry calibration is running
 
     @property
     def done(self):
         return self.baseline is not None
+
+    @property
+    def frown_active(self):
+        return self.frown_samples is not None
 
     def add(self, features):
         if self.done:
             return False
         self.samples.append(features)
         if len(self.samples) >= self.n_frames:
-            self.baseline = {k: float(np.mean([s[k] for s in self.samples])) for k in FEATURE_NAMES}
+            base = {k: float(np.mean([s[k] for s in self.samples])) for k in FEATURE_NAMES}
+            # personal jitter: how much the frown score wobbles while the face is held neutral
+            noise = float(np.std([frown_score(s, base) for s in self.samples]))
+            base["frown_noise"] = noise
+            base["angry_thresh"] = max(TH["angry_score"], TH["angry_noise_k"] * noise)
+            self.baseline = base
             return True
         return False
+
+    def start_frown(self):
+        if self.done:
+            self.frown_samples = []
+
+    def add_frown(self, features):
+        """Collect frown frames; returns True when the personal angry threshold is set."""
+        self.frown_samples.append(frown_score(features, self.baseline))
+        if len(self.frown_samples) < self.n_frown:
+            return False
+        frown = float(np.mean(self.frown_samples))
+        self.frown_samples = None
+        if frown < 0.04:
+            print(f"[calibration] frown score only {frown:.3f} - too small, keeping "
+                  f"threshold {self.baseline['angry_thresh']:.3f}. Press 'a' and frown harder.")
+            return True
+        # halfway between neutral (score 0) and this person's real frown,
+        # but kept clear of their own jitter so a still face never flickers to angry
+        self.baseline["angry_thresh"] = max(0.03, 2.5 * self.baseline["frown_noise"], frown / 2)
+        print(f"[calibration] frown score {frown:.3f} -> angry threshold {self.baseline['angry_thresh']:.3f}")
+        return True
 
 
 # 4. CLASSIFY
@@ -136,6 +182,10 @@ def classify_expression(f, base):
     if (f["mouth_open"] - base["mouth_open"] > TH["shocked_mouth_delta"]
             or f["brow"] - base["brow"] > TH["shocked_brow_delta"]):
         return "shocked"
+    # angry: brows pulled down and/or together, relative to this person's own
+    # neutral face, beyond a threshold personalised during calibration
+    if frown_score(f, base) > base.get("angry_thresh", TH["angry_score"]):
+        return "angry"
     if f["smile_curve"] - base["smile_curve"] < TH["sad_curve_delta"]:
         return "sad"
     return "neutral"
@@ -237,18 +287,21 @@ def draw_debug(frame, features, baseline, raw_label=None):
             lines.append(f"{k:<12}{v:+.3f}")
             continue
         b = baseline[k]
-        if k in ("eye_open", "mouth_width"):
+        if k in ("eye_open", "mouth_width", "brow_gap"):
             rel = f"x{v / b:.2f}" if abs(b) > 1e-6 else "x--"
         else:
             rel = f"{v - b:+.3f}"
         lines.append(f"{k:<12}{v:+.3f}  base {b:+.3f}  {rel}")
+    if baseline is not None:
+        thresh = baseline.get("angry_thresh", TH["angry_score"])
+        lines.append(f"frown score {frown_score(features, baseline):+.3f}  angry > {thresh:.3f}")
     if raw_label is not None:
         lines.append(f"frame label: {raw_label}")
 
     lh = 20
     w = max(cv2.getTextSize(s, FONT, 0.5, 1)[0][0] for s in lines) + 20
     h = lh * len(lines) + 12
-    y0 = frame.shape[0] - h - 10
+    y0 = 45  # top-left, just below the status label
     overlay = frame.copy()
     cv2.rectangle(overlay, (10, y0), (10 + w, y0 + h), (0, 0, 0), -1)
     cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
@@ -291,6 +344,16 @@ def annotate(frame, face_mesh, stickers, baseline, debug, smoother=None, calibra
             draw_debug(frame, features, None)
         return None, features
 
+    if calibrator is not None and calibrator.frown_active:
+        calibrator.add_frown(features)
+        cv2.rectangle(frame, bbox[:2], bbox[2:], COLOURS["angry"], 2)
+        n = len(calibrator.frown_samples) if calibrator.frown_active else calibrator.n_frown
+        put_label(frame, f"Calibrating angry - frown hard ({n}/{calibrator.n_frown})",
+                  (10, 30), COLOURS["angry"])
+        if smoother:
+            smoother.reset()
+        return None, features
+
     raw = classify_expression(features, baseline)
     label = smoother.update(raw) if smoother else raw
 
@@ -321,7 +384,7 @@ def run_webcam(camera_index=0):
     debug = True
     fps, last = 0.0, time.perf_counter()
     window = "Cat Sticker Face Detector"
-    print("Keys: q = quit, r = recalibrate, d = toggle debug, s = screenshot")
+    print("Keys: q = quit, r = recalibrate, a = calibrate angry (frown), d = toggle debug, s = screenshot")
 
     with create_face_mesh() as face_mesh:
         while True:
@@ -347,6 +410,10 @@ def run_webcam(camera_index=0):
                 calibrator.reset()
                 smoother.reset()
                 print("[calibration] restarting - hold a neutral face")
+            elif key == ord("a"):
+                if calibrator.done:
+                    calibrator.start_frown()
+                    print("[calibration] frown hard and hold it")
             elif key == ord("d"):
                 debug = not debug
             elif key == ord("s"):

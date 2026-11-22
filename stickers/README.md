@@ -6,6 +6,7 @@ Put one cat meme image per expression in this folder, using exactly these filena
 |---------------|------------------------------|
 | `happy.png`   | happy (wide smile)           |
 | `shocked.png` | shocked (mouth open / brows raised) |
+| `angry.png`   | angry (brows lowered / pulled together) |
 | `sad.png`     | sad (mouth corners down)     |
 | `sleepy.png`  | sleepy (eyes closing)        |
 | `neutral.png` | neutral (anything else)      |
